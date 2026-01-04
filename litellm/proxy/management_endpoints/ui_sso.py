@@ -16,6 +16,7 @@ import secrets
 from copy import deepcopy
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union, cast
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import RedirectResponse
 
@@ -1428,8 +1429,6 @@ class SSOAuthenticationHandler:
         """
         # Google SSO Auth
         if google_client_id is not None:
-            from fastapi_sso.sso.google import GoogleSSO
-
             google_client_secret = os.getenv("GOOGLE_CLIENT_SECRET", None)
             if google_client_secret is None:
                 raise ProxyException(
@@ -1438,20 +1437,32 @@ class SSOAuthenticationHandler:
                     param="GOOGLE_CLIENT_SECRET",
                     code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 )
-            google_sso = GoogleSSO(
-                client_id=google_client_id,
-                client_secret=google_client_secret,
-                redirect_uri=redirect_url,
-            )
-            verbose_proxy_logger.info(
-                f"In /google-login/key/generate, \nGOOGLE_REDIRECT_URI: {redirect_url}\nGOOGLE_CLIENT_ID: {google_client_id}"
-            )
-            with google_sso:
-                return await google_sso.get_login_redirect(state=state)
+
+            # Check if PKCE is enabled for Google SSO
+            use_google_pkce = os.getenv("GOOGLE_CLIENT_USE_PKCE", "false").lower() == "true"
+
+            if use_google_pkce:
+                verbose_proxy_logger.info("Using PKCE for Google SSO")
+                return await SSOAuthenticationHandler.get_google_sso_redirect_with_pkce(
+                    google_client_id=google_client_id,
+                    redirect_url=redirect_url,
+                    state=state,
+                )
+            else:
+                from fastapi_sso.sso.google import GoogleSSO
+
+                google_sso = GoogleSSO(
+                    client_id=google_client_id,
+                    client_secret=google_client_secret,
+                    redirect_uri=redirect_url,
+                )
+                verbose_proxy_logger.info(
+                    f"In /google-login/key/generate, \nGOOGLE_REDIRECT_URI: {redirect_url}\nGOOGLE_CLIENT_ID: {google_client_id}"
+                )
+                with google_sso:
+                    return await google_sso.get_login_redirect(state=state)
         # Microsoft SSO Auth
         elif microsoft_client_id is not None:
-            from fastapi_sso.sso.microsoft import MicrosoftSSO
-
             microsoft_client_secret = os.getenv("MICROSOFT_CLIENT_SECRET", None)
             microsoft_tenant = os.getenv("MICROSOFT_TENANT", None)
             if microsoft_client_secret is None:
@@ -1461,15 +1472,30 @@ class SSOAuthenticationHandler:
                     param="MICROSOFT_CLIENT_SECRET",
                     code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                 )
-            microsoft_sso = MicrosoftSSO(
-                client_id=microsoft_client_id,
-                client_secret=microsoft_client_secret,
-                tenant=microsoft_tenant,
-                redirect_uri=redirect_url,
-                allow_insecure_http=True,
-            )
-            with microsoft_sso:
-                return await microsoft_sso.get_login_redirect(state=state)
+
+            # Check if PKCE is enabled for Microsoft SSO
+            use_microsoft_pkce = os.getenv("MICROSOFT_CLIENT_USE_PKCE", "false").lower() == "true"
+
+            if use_microsoft_pkce:
+                verbose_proxy_logger.info("Using PKCE for Microsoft SSO")
+                return await SSOAuthenticationHandler.get_microsoft_sso_redirect_with_pkce(
+                    microsoft_client_id=microsoft_client_id,
+                    microsoft_tenant=microsoft_tenant,
+                    redirect_url=redirect_url,
+                    state=state,
+                )
+            else:
+                from fastapi_sso.sso.microsoft import MicrosoftSSO
+
+                microsoft_sso = MicrosoftSSO(
+                    client_id=microsoft_client_id,
+                    client_secret=microsoft_client_secret,
+                    tenant=microsoft_tenant,
+                    redirect_uri=redirect_url,
+                    allow_insecure_http=True,
+                )
+                with microsoft_sso:
+                    return await microsoft_sso.get_login_redirect(state=state)
         elif generic_client_id is not None:
             from fastapi_sso.sso.base import DiscoveryDocument
             from fastapi_sso.sso.generic import create_provider
@@ -2247,6 +2273,123 @@ class SSOAuthenticationHandler:
 
         return code_verifier, code_challenge
 
+    @staticmethod
+    async def get_google_sso_redirect_with_pkce(
+        google_client_id: str,
+        redirect_url: str,
+        state: Optional[str] = None,
+    ) -> RedirectResponse:
+        """
+        Get Google SSO redirect with PKCE enabled.
+
+        This manually constructs the Google OAuth authorization URL with PKCE parameters.
+
+        Args:
+            google_client_id: Google OAuth client ID
+            redirect_url: OAuth redirect URI
+            state: Optional state parameter for CSRF protection
+
+        Returns:
+            RedirectResponse with PKCE-enabled authorization URL
+        """
+        from litellm.proxy.proxy_server import user_api_key_cache
+        from urllib.parse import urlencode
+
+        # Generate PKCE parameters
+        code_verifier, code_challenge = SSOAuthenticationHandler.generate_pkce_params()
+
+        # Generate state if not provided
+        if not state:
+            state = uuid.uuid4().hex
+
+        # Store code_verifier in cache (10 min TTL)
+        cache_key = f"pkce_verifier:{state}"
+        user_api_key_cache.set_cache(key=cache_key, value=code_verifier, ttl=600)
+        verbose_proxy_logger.debug(f"Stored PKCE verifier with key: {cache_key}")
+
+        # Google OAuth authorization endpoint
+        auth_url = "https://accounts.google.com/o/oauth2/v2/auth"
+
+        # Build authorization URL parameters
+        params = {
+            "client_id": google_client_id,
+            "redirect_uri": redirect_url,
+            "response_type": "code",
+            "scope": "openid email profile",
+            "state": state,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+        }
+
+        # Construct full authorization URL
+        auth_url_with_params = f"{auth_url}?{urlencode(params)}"
+
+        verbose_proxy_logger.debug(
+            f"Google SSO PKCE authorization URL: {auth_url_with_params}"
+        )
+
+        return RedirectResponse(url=auth_url_with_params, status_code=303)
+
+    @staticmethod
+    async def get_microsoft_sso_redirect_with_pkce(
+        microsoft_client_id: str,
+        microsoft_tenant: Optional[str],
+        redirect_url: str,
+        state: Optional[str] = None,
+    ) -> RedirectResponse:
+        """
+        Get Microsoft SSO redirect with PKCE enabled.
+
+        This manually constructs the Microsoft OAuth authorization URL with PKCE parameters.
+
+        Args:
+            microsoft_client_id: Microsoft OAuth client ID
+            microsoft_tenant: Microsoft AD tenant ID (or 'common')
+            redirect_url: OAuth redirect URI
+            state: Optional state parameter for CSRF protection
+
+        Returns:
+            RedirectResponse with PKCE-enabled authorization URL
+        """
+        from litellm.proxy.proxy_server import user_api_key_cache
+        from urllib.parse import urlencode
+
+        # Generate PKCE parameters
+        code_verifier, code_challenge = SSOAuthenticationHandler.generate_pkce_params()
+
+        # Generate state if not provided
+        if not state:
+            state = uuid.uuid4().hex
+
+        # Store code_verifier in cache (10 min TTL)
+        cache_key = f"pkce_verifier:{state}"
+        user_api_key_cache.set_cache(key=cache_key, value=code_verifier, ttl=600)
+        verbose_proxy_logger.debug(f"Stored PKCE verifier with key: {cache_key}")
+
+        # Microsoft OAuth authorization endpoint
+        tenant = microsoft_tenant or "common"
+        auth_url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize"
+
+        # Build authorization URL parameters
+        params = {
+            "client_id": microsoft_client_id,
+            "redirect_uri": redirect_url,
+            "response_type": "code",
+            "scope": "openid email profile",
+            "state": state,
+            "code_challenge": code_challenge,
+            "code_challenge_method": "S256",
+        }
+
+        # Construct full authorization URL
+        auth_url_with_params = f"{auth_url}?{urlencode(params)}"
+
+        verbose_proxy_logger.debug(
+            f"Microsoft SSO PKCE authorization URL: {auth_url_with_params}"
+        )
+
+        return RedirectResponse(url=auth_url_with_params, status_code=303)
+
 
 class MicrosoftSSOHandler:
     """
@@ -2265,6 +2408,158 @@ class MicrosoftSSOHandler:
     GRAPH_API_RESPONSE_KEY = "graph_api_user_groups"
 
     @staticmethod
+    async def get_microsoft_callback_response_with_pkce(
+        request: Request,
+        microsoft_client_id: str,
+        redirect_url: str,
+        return_raw_sso_response: bool = False,
+    ) -> Union[CustomOpenID, dict]:
+        """
+        Handle Microsoft SSO callback with PKCE.
+
+        This manually exchanges the authorization code for tokens using PKCE,
+        then fetches user information from Microsoft Graph API.
+
+        Args:
+            request: FastAPI Request object
+            microsoft_client_id: Microsoft OAuth client ID
+            redirect_url: OAuth redirect URI
+            return_raw_sso_response: If True, return the raw SSO response
+
+        Returns:
+            CustomOpenID object with user information
+        """
+        from litellm.proxy.proxy_server import user_api_key_cache
+
+        microsoft_client_secret = os.getenv("MICROSOFT_CLIENT_SECRET", None)
+        microsoft_tenant = os.getenv("MICROSOFT_TENANT", None)
+        if microsoft_client_secret is None:
+            raise ProxyException(
+                message="MICROSOFT_CLIENT_SECRET not set. Set it in .env file",
+                type=ProxyErrorTypes.auth_error,
+                param="MICROSOFT_CLIENT_SECRET",
+                code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+        if microsoft_tenant is None:
+            raise ProxyException(
+                message="MICROSOFT_TENANT not set. Set it in .env file",
+                type=ProxyErrorTypes.auth_error,
+                param="MICROSOFT_TENANT",
+                code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        # Get authorization code and state from request
+        query_params = dict(request.query_params)
+        code = query_params.get("code")
+        state = query_params.get("state")
+
+        if not code:
+            raise HTTPException(
+                status_code=400,
+                detail="Authorization code not found in callback request",
+            )
+
+        if not state:
+            raise HTTPException(
+                status_code=400,
+                detail="State not found in callback request",
+            )
+
+        # Retrieve code_verifier from cache
+        cache_key = f"pkce_verifier:{state}"
+        code_verifier = user_api_key_cache.get_cache(key=cache_key)
+
+        if not code_verifier:
+            raise HTTPException(
+                status_code=400,
+                detail="PKCE code_verifier not found or expired. Please retry authentication.",
+            )
+
+        verbose_proxy_logger.debug(f"Retrieved PKCE verifier for state: {state}")
+
+        # Clean up the cache entry (single-use verifier)
+        user_api_key_cache.delete_cache(key=cache_key)
+
+        # Microsoft OAuth token endpoint
+        tenant = microsoft_tenant or "common"
+        token_endpoint = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+
+        # Exchange authorization code for tokens using PKCE
+        token_data = {
+            "code": code,
+            "client_id": microsoft_client_id,
+            "client_secret": microsoft_client_secret,
+            "redirect_uri": redirect_url,
+            "grant_type": "authorization_code",
+            "code_verifier": code_verifier,
+        }
+
+        async with httpx.AsyncClient() as client:
+            token_response = await client.post(
+                token_endpoint,
+                data=token_data,
+            )
+            token_response.raise_for_status()
+            token_response_data = token_response.json()
+
+        access_token = token_response_data.get("access_token")
+        id_token = token_response_data.get("id_token")
+
+        if not access_token:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to obtain access token from Microsoft",
+            )
+
+        # Fetch user info from Microsoft Graph API
+        userinfo_endpoint = "https://graph.microsoft.com/v1.0/me"
+        async with httpx.AsyncClient() as client:
+            userinfo_response = await client.get(
+                userinfo_endpoint,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            userinfo_response.raise_for_status()
+            userinfo = userinfo_response.json()
+
+        verbose_proxy_logger.debug(f"Microsoft Graph UserInfo response: {userinfo}")
+
+        # Get user groups from Graph API
+        user_team_ids = await MicrosoftSSOHandler.get_user_groups_from_graph_api(
+            access_token=access_token
+        )
+
+        # Extract app roles from the id_token JWT
+        app_roles = MicrosoftSSOHandler.get_app_roles_from_id_token(
+            id_token=id_token
+        )
+        verbose_proxy_logger.debug(f"Extracted app roles from id_token: {app_roles}")
+
+        # Determine user role from app roles
+        user_role: Optional[LitellmUserRoles] = None
+        if app_roles:
+            for role_str in app_roles:
+                role = get_litellm_user_role(role_str)
+                if role is not None:
+                    user_role = role
+                    verbose_proxy_logger.debug(
+                        f"Found valid LitellmUserRoles '{role.value}' in app_roles"
+                    )
+                    break
+
+        # if user is trying to get the raw sso response for debugging, return the raw sso response
+        if return_raw_sso_response:
+            userinfo[MicrosoftSSOHandler.GRAPH_API_RESPONSE_KEY] = user_team_ids
+            userinfo["app_roles"] = app_roles
+            return userinfo
+
+        # Create CustomOpenID object from user info
+        return MicrosoftSSOHandler.openid_from_response(
+            response=userinfo,
+            team_ids=user_team_ids,
+            user_role=user_role,
+        )
+
+    @staticmethod
     async def get_microsoft_callback_response(
         request: Request,
         microsoft_client_id: str,
@@ -2277,6 +2572,18 @@ class MicrosoftSSOHandler:
         Args:
             return_raw_sso_response: If True, return the raw SSO response
         """
+        # Check if PKCE is enabled for Microsoft SSO
+        use_microsoft_pkce = os.getenv("MICROSOFT_CLIENT_USE_PKCE", "false").lower() == "true"
+
+        if use_microsoft_pkce:
+            verbose_proxy_logger.info("Using PKCE for Microsoft SSO callback")
+            return await MicrosoftSSOHandler.get_microsoft_callback_response_with_pkce(
+                request=request,
+                microsoft_client_id=microsoft_client_id,
+                redirect_url=redirect_url,
+                return_raw_sso_response=return_raw_sso_response,
+            )
+
         from fastapi_sso.sso.microsoft import MicrosoftSSO
 
         microsoft_client_secret = os.getenv("MICROSOFT_CLIENT_SECRET", None)
@@ -2626,6 +2933,122 @@ class GoogleSSOHandler:
     """
 
     @staticmethod
+    async def get_google_callback_response_with_pkce(
+        request: Request,
+        google_client_id: str,
+        redirect_url: str,
+        return_raw_sso_response: bool = False,
+    ) -> Union[CustomOpenID, dict]:
+        """
+        Handle Google SSO callback with PKCE.
+
+        This manually exchanges the authorization code for tokens using PKCE,
+        then fetches user information from Google's UserInfo endpoint.
+
+        Args:
+            request: FastAPI Request object
+            google_client_id: Google OAuth client ID
+            redirect_url: OAuth redirect URI
+            return_raw_sso_response: If True, return the raw SSO response
+
+        Returns:
+            CustomOpenID object with user information
+        """
+        from litellm.proxy.proxy_server import user_api_key_cache
+
+        google_client_secret = os.getenv("GOOGLE_CLIENT_SECRET", None)
+        if google_client_secret is None:
+            raise ProxyException(
+                message="GOOGLE_CLIENT_SECRET not set. Set it in .env file",
+                type=ProxyErrorTypes.auth_error,
+                param="GOOGLE_CLIENT_SECRET",
+                code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+        # Get authorization code and state from request
+        query_params = dict(request.query_params)
+        code = query_params.get("code")
+        state = query_params.get("state")
+
+        if not code:
+            raise HTTPException(
+                status_code=400,
+                detail="Authorization code not found in callback request",
+            )
+
+        if not state:
+            raise HTTPException(
+                status_code=400,
+                detail="State not found in callback request",
+            )
+
+        # Retrieve code_verifier from cache
+        cache_key = f"pkce_verifier:{state}"
+        code_verifier = user_api_key_cache.get_cache(key=cache_key)
+
+        if not code_verifier:
+            raise HTTPException(
+                status_code=400,
+                detail="PKCE code_verifier not found or expired. Please retry authentication.",
+            )
+
+        verbose_proxy_logger.debug(f"Retrieved PKCE verifier for state: {state}")
+
+        # Clean up the cache entry (single-use verifier)
+        user_api_key_cache.delete_cache(key=cache_key)
+
+        # Exchange authorization code for tokens using PKCE
+        token_endpoint = "https://oauth2.googleapis.com/token"
+        token_data = {
+            "code": code,
+            "client_id": google_client_id,
+            "redirect_uri": redirect_url,
+            "grant_type": "authorization_code",
+            "code_verifier": code_verifier,
+        }
+
+        async with httpx.AsyncClient() as client:
+            token_response = await client.post(
+                token_endpoint,
+                data=token_data,
+            )
+            token_response.raise_for_status()
+            token_response_data = token_response.json()
+
+        access_token = token_response_data.get("access_token")
+        if not access_token:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to obtain access token from Google",
+            )
+
+        # Fetch user info from Google UserInfo endpoint
+        userinfo_endpoint = "https://www.googleapis.com/oauth2/v2/userinfo"
+        async with httpx.AsyncClient() as client:
+            userinfo_response = await client.get(
+                userinfo_endpoint,
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            userinfo_response.raise_for_status()
+            userinfo = userinfo_response.json()
+
+        verbose_proxy_logger.debug(f"Google UserInfo response: {userinfo}")
+
+        if return_raw_sso_response:
+            return userinfo
+
+        # Create CustomOpenID object from user info
+        return CustomOpenID(
+            id=userinfo.get("id"),
+            email=userinfo.get("email"),
+            display_name=userinfo.get("name"),
+            first_name=userinfo.get("given_name"),
+            last_name=userinfo.get("family_name"),
+            picture=userinfo.get("picture"),
+            provider="google",
+        )
+
+    @staticmethod
     async def get_google_callback_response(
         request: Request,
         google_client_id: str,
@@ -2638,6 +3061,18 @@ class GoogleSSOHandler:
         Args:
             return_raw_sso_response: If True, return the raw SSO response
         """
+        # Check if PKCE is enabled for Google SSO
+        use_google_pkce = os.getenv("GOOGLE_CLIENT_USE_PKCE", "false").lower() == "true"
+
+        if use_google_pkce:
+            verbose_proxy_logger.info("Using PKCE for Google SSO callback")
+            return await GoogleSSOHandler.get_google_callback_response_with_pkce(
+                request=request,
+                google_client_id=google_client_id,
+                redirect_url=redirect_url,
+                return_raw_sso_response=return_raw_sso_response,
+            )
+
         from fastapi_sso.sso.google import GoogleSSO
 
         google_client_secret = os.getenv("GOOGLE_CLIENT_SECRET", None)

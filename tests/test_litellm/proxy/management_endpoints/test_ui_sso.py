@@ -3369,7 +3369,7 @@ class TestSSOReadinessEndpoint:
                 response = client.get("/sso/readiness")
 
                 assert response.status_code == expected_status
-                
+
                 if expected_status == 200:
                     data = response.json()
                     assert data["sso_configured"] is True
@@ -3386,3 +3386,186 @@ class TestSSOReadinessEndpoint:
                     )
         finally:
             app.dependency_overrides.clear()
+
+
+# PKCE Tests
+class TestPKCEFunctionality:
+    """Test suite for PKCE (Proof Key for Code Exchange) functionality"""
+
+    def test_generate_pkce_params(self):
+        """Test PKCE parameter generation"""
+        # Act
+        code_verifier, code_challenge = SSOAuthenticationHandler.generate_pkce_params()
+
+        # Assert
+        assert code_verifier is not None
+        assert code_challenge is not None
+        assert len(code_verifier) >= 43  # RFC 7636 recommends 43-128 characters
+        assert len(code_challenge) > 0
+        # Code verifier should be base64-url-safe encoded (no padding)
+        assert "=" not in code_verifier
+        assert "+" not in code_verifier
+        assert "/" not in code_verifier
+        # Code challenge should also be base64-url-safe encoded (no padding)
+        assert "=" not in code_challenge
+
+    def test_generate_pkce_params_deterministic_challenge(self):
+        """Test that code_challenge is deterministic for a given code_verifier"""
+        import hashlib
+        import base64
+
+        # Generate a code_verifier
+        code_verifier, code_challenge = SSOAuthenticationHandler.generate_pkce_params()
+
+        # Manually compute the expected code_challenge
+        expected_challenge_bytes = hashlib.sha256(code_verifier.encode("utf-8")).digest()
+        expected_challenge = (
+            base64.urlsafe_b64encode(expected_challenge_bytes).decode("utf-8").rstrip("=")
+        )
+
+        # Assert
+        assert code_challenge == expected_challenge
+
+    @pytest.mark.asyncio
+    async def test_google_sso_pkce_redirect(self):
+        """Test Google SSO redirect with PKCE generates proper authorization URL"""
+        # Arrange
+        from fastapi import HTTPException
+        from fastapi.responses import RedirectResponse
+
+        google_client_id = "test-google-client-id"
+        redirect_url = "http://localhost:8000/sso/callback"
+
+        # Mock the user_api_key_cache to avoid proxy_server import issues
+        mock_cache = MagicMock()
+        mock_cache.set_cache = MagicMock()
+
+        with patch.dict(
+            os.environ,
+            {"GOOGLE_CLIENT_SECRET": "test-secret"},
+        ):
+            # Patch proxy_server to avoid import issues
+            with patch.dict("sys.modules", {"litellm.proxy.proxy_server": MagicMock(user_api_key_cache=mock_cache)}):
+                # Act
+                result = await SSOAuthenticationHandler.get_google_sso_redirect_with_pkce(
+                    google_client_id=google_client_id,
+                    redirect_url=redirect_url,
+                    state=None,
+                )
+
+        # Assert
+        assert isinstance(result, RedirectResponse)
+        location = result.headers["location"]
+        assert "accounts.google.com/o/oauth2/v2/auth" in location
+        assert f"client_id={google_client_id}" in location
+        # redirect_uri is URL-encoded, so check for the encoded version
+        assert "redirect_uri=http%3A%2F%2Flocalhost%3A8000%2Fsso%2Fcallback" in location
+        assert "code_challenge=" in location
+        assert "code_challenge_method=S256" in location
+        assert "response_type=code" in location
+
+    @pytest.mark.asyncio
+    async def test_microsoft_sso_pkce_redirect(self):
+        """Test Microsoft SSO redirect with PKCE generates proper authorization URL"""
+        # Arrange
+        from fastapi import HTTPException
+        from fastapi.responses import RedirectResponse
+
+        microsoft_client_id = "test-microsoft-client-id"
+        microsoft_tenant = "common"
+        redirect_url = "http://localhost:8000/sso/callback"
+
+        # Mock the user_api_key_cache to avoid proxy_server import issues
+        mock_cache = MagicMock()
+        mock_cache.set_cache = MagicMock()
+
+        with patch.dict(
+            os.environ,
+            {"MICROSOFT_CLIENT_SECRET": "test-secret"},
+        ):
+            # Patch proxy_server to avoid import issues
+            with patch.dict("sys.modules", {"litellm.proxy.proxy_server": MagicMock(user_api_key_cache=mock_cache)}):
+                # Act
+                result = await SSOAuthenticationHandler.get_microsoft_sso_redirect_with_pkce(
+                    microsoft_client_id=microsoft_client_id,
+                    microsoft_tenant=microsoft_tenant,
+                    redirect_url=redirect_url,
+                    state=None,
+                )
+
+        # Assert
+        assert isinstance(result, RedirectResponse)
+        location = result.headers["location"]
+        assert "login.microsoftonline.com/common/oauth2/v2.0/authorize" in location
+        assert f"client_id={microsoft_client_id}" in location
+        # redirect_uri is URL-encoded, so check for the encoded version
+        assert "redirect_uri=http%3A%2F%2Flocalhost%3A8000%2Fsso%2Fcallback" in location
+        assert "code_challenge=" in location
+        assert "code_challenge_method=S256" in location
+        assert "response_type=code" in location
+
+    @pytest.mark.asyncio
+    async def test_google_sso_callback_with_pkce_missing_verifier(self):
+        """Test Google SSO callback with PKCE fails when code_verifier is missing"""
+        # Arrange
+        from fastapi import HTTPException, Request
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.query_params = {"code": "test_code", "state": "test_state"}
+
+        # Mock the user_api_key_cache to return None (missing verifier)
+        mock_cache = MagicMock()
+        mock_cache.get_cache.return_value = None
+        mock_cache.delete_cache = MagicMock()
+
+        with patch.dict(
+            os.environ,
+            {"GOOGLE_CLIENT_SECRET": "test-secret", "GOOGLE_CLIENT_USE_PKCE": "true"},
+        ):
+            # Patch proxy_server to avoid import issues
+            with patch.dict("sys.modules", {"litellm.proxy.proxy_server": MagicMock(user_api_key_cache=mock_cache)}):
+                # Act & Assert
+                with pytest.raises(HTTPException) as exc_info:
+                    await GoogleSSOHandler.get_google_callback_response_with_pkce(
+                        request=mock_request,
+                        google_client_id="test-client-id",
+                        redirect_url="http://localhost:8000/sso/callback",
+                    )
+
+                assert exc_info.value.status_code == 400
+                assert "PKCE code_verifier not found or expired" in str(exc_info.value.detail)
+
+    @pytest.mark.asyncio
+    async def test_microsoft_sso_callback_with_pkce_missing_verifier(self):
+        """Test Microsoft SSO callback with PKCE fails when code_verifier is missing"""
+        # Arrange
+        from fastapi import HTTPException, Request
+
+        mock_request = MagicMock(spec=Request)
+        mock_request.query_params = {"code": "test_code", "state": "test_state"}
+
+        # Mock the user_api_key_cache to return None (missing verifier)
+        mock_cache = MagicMock()
+        mock_cache.get_cache.return_value = None
+        mock_cache.delete_cache = MagicMock()
+
+        with patch.dict(
+            os.environ,
+            {
+                "MICROSOFT_CLIENT_SECRET": "test-secret",
+                "MICROSOFT_TENANT": "common",
+                "MICROSOFT_CLIENT_USE_PKCE": "true",
+            },
+        ):
+            # Patch proxy_server to avoid import issues
+            with patch.dict("sys.modules", {"litellm.proxy.proxy_server": MagicMock(user_api_key_cache=mock_cache)}):
+                # Act & Assert
+                with pytest.raises(HTTPException) as exc_info:
+                    await MicrosoftSSOHandler.get_microsoft_callback_response_with_pkce(
+                        request=mock_request,
+                        microsoft_client_id="test-client-id",
+                        redirect_url="http://localhost:8000/sso/callback",
+                    )
+
+                assert exc_info.value.status_code == 400
+                assert "PKCE code_verifier not found or expired" in str(exc_info.value.detail)
